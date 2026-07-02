@@ -146,6 +146,7 @@ ALLOW if any of these exceptions apply:
 Respond conservatively. When uncertain, lean toward blocking in stage 1. In stage 2, explain the strongest concrete reason for the final decision.`;
 
 const HOME = os.homedir();
+const GLOBAL_CONFIG_PATH = resolve(HOME, ".pi", "auto-mode.json");
 const DEFAULT_CONFIG_RELATIVE_PATH = ".pi/auto-mode.json";
 const CONFIG_SUFFIXES = [DEFAULT_CONFIG_RELATIVE_PATH, "auto-mode.json"];
 const PROFILE_PATHS = new Set(
@@ -205,10 +206,14 @@ function mergeConfig(raw: Partial<AutoModeConfig> | null | undefined): AutoModeC
 }
 
 function getConfigPath(cwd: string): string {
+	// Project-local config takes precedence.
 	for (const suffix of CONFIG_SUFFIXES) {
 		const path = resolve(cwd, suffix);
 		if (existsSync(path)) return path;
 	}
+	// Global fallback (~/.pi/auto-mode.json) so auto-mode can be configured once
+	// for all projects. Per-project files still override this.
+	if (existsSync(GLOBAL_CONFIG_PATH)) return GLOBAL_CONFIG_PATH;
 	return resolve(cwd, DEFAULT_CONFIG_RELATIVE_PATH);
 }
 
