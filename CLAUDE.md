@@ -117,10 +117,21 @@ installs that only have the `@mariozechner` scope.
 - **Testing changes locally:** run the fork directly without reinstalling the npm package —
   `pi --extension ~/Projects/pi-auto-mode/extensions/auto-mode.ts -p "<prompt>"`. This
   shadows the installed `npm:pi-auto-mode` for that run.
-- **Verifying gating:** benign bash (`echo …`) should pass; an `~/.ssh/authorized_keys`
-  write triggers a hard-deny regex and should be blocked.
+- **Verifying gating:** first confirm auto-mode is actually enabled (`enabled: true` in
+  the resolved config, or `/auto-mode status`) — a passing action is meaningless if the
+  gate is off, since disabled auto-mode lets everything through. Then probe with benign
+  bash (`echo …`): `bash` is **not** in the default allowlist (only `read`/`grep`/`find`/
+  `ls` are), so it genuinely hits the classifier when enabled. A passing `echo` with
+  auto-mode on is real evidence the classifier ran and allowed it. For the hard-deny
+  path, `echo x >> ~/.ssh/authorized_keys` triggers the SSH-key-injection regex
+  regardless of model. Beware: an agent may refuse to *attempt* a `write` to
+  `~/.ssh/authorized_keys` on its own judgement, which exercises nothing — use the bash
+  redirect form so the hard-deny regex actually fires.
 - **Config for testing:** `~/.pi/auto-mode.json` (global) or `<cwd>/.pi/auto-mode.json`
-  (project). The shipped `auto-mode.example.json` documents all fields.
+  (project). The shipped `auto-mode.example.json` documents all fields. Mind the
+  cross-session clobber race described under item 1 above — after hand-editing the file,
+  run `/auto-mode reload` in any active session so its in-memory copy syncs and doesn't
+  overwrite your edit on its next `saveConfig`.
 - **Don't** start implementing the remaining configurable prompts (the shared classifier
   system prompt or `agentGuidance`; item 2 above) unless explicitly asked — that work is
   earmarked for a delegated agent. The user-message overrides (stage1/stage2 instructions
