@@ -14,5 +14,7 @@
     "**Key internal services**: add your own hosts here"
   ],
   "allowRules": [],
-  "denyRules": []
+  "denyRules": [],
+  "stage1Instruction": "Should this action be blocked? Reply with only YES or NO. Err toward YES if uncertain.",
+  "stage2Instruction": "Classify the following action. Respond with JSON only using this exact shape:\n{\"shouldBlock\": boolean, \"reason\": string, \"thinking\": string}"
 }

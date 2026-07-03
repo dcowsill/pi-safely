@@ -20,6 +20,10 @@ type AutoModeConfig = {
 	environment: string[];
 	allowRules: string[];
 	denyRules: string[];
+	stage1Instruction?: string;
+	stage2Instruction?: string;
+	stage1Message?: string;
+	stage2Message?: string;
 };
 
 type DenialRecord = {
@@ -145,6 +149,12 @@ ALLOW if any of these exceptions apply:
 
 Respond conservatively. When uncertain, lean toward blocking in stage 1. In stage 2, explain the strongest concrete reason for the final decision.`;
 
+const DEFAULT_STAGE1_INSTRUCTION =
+	"Should this action be blocked? Reply with only YES or NO. Err toward YES if uncertain.";
+
+const DEFAULT_STAGE2_INSTRUCTION = `Classify the following action. Respond with JSON only using this exact shape:
+{"shouldBlock": boolean, "reason": string, "thinking": string}`;
+
 const HOME = os.homedir();
 const GLOBAL_CONFIG_PATH = resolve(HOME, ".pi", "auto-mode.json");
 const DEFAULT_CONFIG_RELATIVE_PATH = ".pi/auto-mode.json";
@@ -202,6 +212,10 @@ function mergeConfig(raw: Partial<AutoModeConfig> | null | undefined): AutoModeC
 			Array.isArray(raw?.denyRules) && raw.denyRules.length > 0
 				? raw.denyRules.map((value) => String(value))
 				: [...DEFAULT_CONFIG.denyRules],
+		stage1Instruction: typeof raw?.stage1Instruction === "string" ? raw.stage1Instruction : undefined,
+		stage2Instruction: typeof raw?.stage2Instruction === "string" ? raw.stage2Instruction : undefined,
+		stage1Message: typeof raw?.stage1Message === "string" ? raw.stage1Message : undefined,
+		stage2Message: typeof raw?.stage2Message === "string" ? raw.stage2Message : undefined,
 	};
 }
 
@@ -442,6 +456,28 @@ function buildClassifierSystemPrompt(config: AutoModeConfig): string {
 		.replace("<ALLOW_RULES>", allowRules);
 }
 
+function interpolateTemplate(template: string, transcript: string, action: string): string {
+	return template.split("{transcript}").join(transcript).split("{action}").join(action);
+}
+
+function buildStage1UserMessage(config: AutoModeConfig, transcript: string, action: string): string {
+	if (config.stage1Message) {
+		return interpolateTemplate(config.stage1Message, transcript || "(no prior transcript)", action);
+	}
+	const instruction = config.stage1Instruction ?? DEFAULT_STAGE1_INSTRUCTION;
+	const transcriptBlock = transcript || "(no prior transcript)";
+	return `<transcript>\n${transcriptBlock}\n</transcript>\n\nAction to evaluate:\n${action}\n\n${instruction}`;
+}
+
+function buildStage2UserMessage(config: AutoModeConfig, transcript: string, action: string): string {
+	if (config.stage2Message) {
+		return interpolateTemplate(config.stage2Message, transcript || "(no prior transcript)", action);
+	}
+	const instruction = config.stage2Instruction ?? DEFAULT_STAGE2_INSTRUCTION;
+	const transcriptBlock = transcript || "(no prior transcript)";
+	return `<transcript>\n${transcriptBlock}\n</transcript>\n\n${instruction}\n\nAction:\n${action}`;
+}
+
 function parseModelSpec(spec: string): { provider: string; id: string } | undefined {
 	const trimmed = spec.trim();
 	const slashIndex = trimmed.indexOf("/");
@@ -587,18 +623,12 @@ async function runStage1(
 	apiKey: string,
 	headers: Record<string, string> | undefined,
 	systemPrompt: string,
-	transcript: string,
-	action: string,
+	userContent: string,
 	signal: AbortSignal | undefined,
 ): Promise<boolean> {
 	const userMessage: UserMessage = {
 		role: "user",
-		content: [
-			{
-				type: "text",
-				text: `<transcript>\n${transcript || "(no prior transcript)"}\n</transcript>\n\nAction to evaluate:\n${action}\n\nShould this action be blocked? Reply with only YES or NO. Err toward YES if uncertain.`,
-			},
-		],
+		content: [{ type: "text", text: userContent }],
 		timestamp: Date.now(),
 	};
 
@@ -623,11 +653,33 @@ function tryParseJsonObject(text: string): ClassificationResult | undefined {
 
 	for (const candidate of candidates) {
 		try {
-			const parsed = JSON.parse(candidate) as Partial<ClassificationResult>;
+			const parsed = JSON.parse(candidate) as Record<string, unknown>;
+
+			// Standard format: {shouldBlock, reason, thinking}
 			if (typeof parsed.shouldBlock === "boolean" && typeof parsed.reason === "string") {
 				return {
 					shouldBlock: parsed.shouldBlock,
 					reason: parsed.reason,
+					thinking: typeof parsed.thinking === "string" ? parsed.thinking : undefined,
+				};
+			}
+
+			// Safety-classifier format: {violation: 0|1, reason/rationale, thinking}
+			// Maps gpt-oss-safeguard and similar T&S model outputs.
+			if (typeof parsed.violation === "number" || typeof parsed.violation === "boolean") {
+				const shouldBlock = typeof parsed.violation === "number"
+					? parsed.violation >= 1
+					: Boolean(parsed.violation);
+				const reason = typeof parsed.reason === "string"
+					? parsed.reason
+					: typeof parsed.rationale === "string"
+						? parsed.rationale
+						: typeof parsed.policy_category === "string"
+							? `Policy violation: ${parsed.policy_category}`
+							: shouldBlock ? "Action violates safety policy" : "Action does not violate policy";
+				return {
+					shouldBlock,
+					reason,
 					thinking: typeof parsed.thinking === "string" ? parsed.thinking : undefined,
 				};
 			}
@@ -636,13 +688,28 @@ function tryParseJsonObject(text: string): ClassificationResult | undefined {
 		}
 	}
 
+	// Regex fallback for shouldBlock format
 	const shouldBlock = /"?shouldBlock"?\s*:\s*(true|false)/i.exec(trimmed);
 	const reason = /"?reason"?\s*:\s*"([\s\S]*?)"/i.exec(trimmed);
-	if (!shouldBlock || !reason) return undefined;
-	return {
-		shouldBlock: shouldBlock[1]?.toLowerCase() === "true",
-		reason: reason[1] ?? "Could not parse reason",
-	};
+	if (shouldBlock && reason) {
+		return {
+			shouldBlock: shouldBlock[1]?.toLowerCase() === "true",
+			reason: reason[1] ?? "Could not parse reason",
+		};
+	}
+
+	// Regex fallback for violation format
+	const violation = /"?violation"?\s*:\s*(0|1|true|false)/i.exec(trimmed);
+	if (violation) {
+		const shouldBlock = violation[1] === "1" || violation[1]?.toLowerCase() === "true";
+		const violationReason = /"?(?:reason|rationale)"?\s*:\s*"([\s\S]*?)"/i.exec(trimmed);
+		return {
+			shouldBlock,
+			reason: violationReason?.[1] ?? (shouldBlock ? "Action violates safety policy" : "Action does not violate policy"),
+		};
+	}
+
+	return undefined;
 }
 
 async function runStage2(
@@ -650,19 +717,13 @@ async function runStage2(
 	apiKey: string,
 	headers: Record<string, string> | undefined,
 	systemPrompt: string,
-	transcript: string,
-	action: string,
+	userContent: string,
 	reasoningEffort: ReasoningEffort,
 	signal: AbortSignal | undefined,
 ): Promise<ClassificationResult> {
 	const userMessage: UserMessage = {
 		role: "user",
-		content: [
-			{
-				type: "text",
-				text: `<transcript>\n${transcript || "(no prior transcript)"}\n</transcript>\n\nClassify the following action. Respond with JSON only using this exact shape:\n{"shouldBlock": boolean, "reason": string, "thinking": string}\n\nAction:\n${action}`,
-			},
-		],
+		content: [{ type: "text", text: userContent }],
 		timestamp: Date.now(),
 	};
 
@@ -1107,6 +1168,8 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 
 		const transcript = buildTranscript(ctx, config.maxTranscriptLines);
 		const systemPrompt = buildClassifierSystemPrompt(config);
+		const stage1Content = buildStage1UserMessage(config, transcript, actionSummary);
+		const stage2Content = buildStage2UserMessage(config, transcript, actionSummary);
 
 		try {
 			const stage1Blocked = await runStage1(
@@ -1114,8 +1177,7 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 				classifier.apiKey,
 				classifier.headers,
 				systemPrompt,
-				transcript,
-				actionSummary,
+				stage1Content,
 				ctx.signal,
 			);
 
@@ -1128,8 +1190,7 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 					classifier.apiKey,
 					classifier.headers,
 					systemPrompt,
-					transcript,
-					actionSummary,
+					stage2Content,
 					config.reasoningEffort,
 					ctx.signal,
 				);

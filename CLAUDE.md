@@ -51,6 +51,19 @@ per-project files as optional overrides. The patch adds a global fallback to
 This matches how pi itself treats user/global vs project-local resources, and how pi's
 `settings.json` (which registers `npm:pi-auto-mode` under `packages`) is global.
 
+> **Caveat (cross-session clobber race):** the global file is a shared mutable resource,
+> but every auto-mode session holds its own in-memory copy loaded once at
+> `session_start`. The `on` / `off` / `toggle` / `model` commands (and the
+> `disable-and-allow` override path) all call `saveConfig`, which writes that
+> session's **entire** in-memory config back over the file — so a session that
+> started before an out-of-band file edit will clobber it with stale values.
+> `off` is especially nasty because it also flips `enabled: false` globally.
+> Practical guidance: when sessions are running, prefer `/auto-mode model` or
+> `/auto-mode reload` over hand-editing the file; after any file edit, run
+> `/auto-mode reload` in active sessions to sync their in-memory copy. A possible
+> fix is narrowing the toggle paths to persist only the `enabled` field (or not
+> persist toggles at all) — open enhancement, not yet implemented.
+
 ### 2. Configurable classifier prompts (planned — not yet implemented)
 
 The three prompt artifacts — the shared system prompt's fixed prose, the Stage 1 user
@@ -71,8 +84,13 @@ principles, the token budgets, and the Stage 2 JSON shape are fixed.
 back to the hardcoded defaults otherwise. This lets us tune Stage-1 bias, swap the JSON
 schema, or customize the principles per project without forking the prose.
 
-> **Status:** implementation is deferred and will be done by a delegated agent. Do **not**
-> start it unless explicitly asked — see "Working in this repo" below.
+> **Status (2026-07-02):** the **user-message** portion is implemented — optional
+> config fields `stage1Instruction` / `stage2Instruction` (instruction-only override,
+> recommended) and `stage1Message` / `stage2Message` (full-template escape hatch with
+> `{transcript}` / `{action}` tokens; wins if present). See `buildStage1UserMessage` /
+> `buildStage2UserMessage` in `extensions/auto-mode.ts`. The remaining artifacts — the
+> shared classifier **system prompt** prose (`systemPrompt`) and the **agent guidance**
+> injection (`agentGuidance`) — are still hardcoded and deferred.
 
 ## Remotes
 
@@ -103,8 +121,10 @@ installs that only have the `@mariozechner` scope.
   write triggers a hard-deny regex and should be blocked.
 - **Config for testing:** `~/.pi/auto-mode.json` (global) or `<cwd>/.pi/auto-mode.json`
   (project). The shipped `auto-mode.example.json` documents all fields.
-- **Don't** start implementing configurable prompts (item 2 above) unless explicitly
-  asked — that work is earmarked for a delegated agent.
+- **Don't** start implementing the remaining configurable prompts (the shared classifier
+  system prompt or `agentGuidance`; item 2 above) unless explicitly asked — that work is
+  earmarked for a delegated agent. The user-message overrides (stage1/stage2 instructions
+  and full templates) are already implemented.
 
 ## Reference
 

@@ -186,6 +186,40 @@ Example:
 - For a cheap GitHub Copilot-backed classifier, `github-copilot/gpt-5.4-mini` is a good default.
 - The extension currently fails open by default, matching the reference repo's behavior when the classifier is unavailable.
 
+### Custom classifier user messages
+
+The stage-1 and stage-2 **user messages** sent to the classifier are hardcoded by
+default, but both can be overridden from config. There are two layers:
+
+1. **Instruction-only override** (recommended): set `stage1Instruction` and/or
+   `stage2Instruction` to replace just the trailing instruction text. The
+   transcript and action are still injected by the built-in scaffolding, so you
+   cannot accidentally drop context. Omitting a field keeps the default.
+
+   ```json
+   {
+     "stage1Instruction": "Should this action be blocked? Reply YES or NO. When in doubt, answer YES.",
+     "stage2Instruction": "Decide whether to block. Return JSON: {\"shouldBlock\": boolean, \"reason\": string}"
+   }
+   ```
+
+2. **Full template override** (escape hatch): set `stage1Message` and/or
+   `stage2Message` to replace the **entire** user message. Use the literal
+   tokens `{transcript}` and `{action}` where you want the transcript and action
+   substituted. A full template, if present, takes precedence over its
+   instruction counterpart.
+
+   ```json
+   {
+     "stage1Message": "## Transcript\n{transcript}\n\n## Proposed action\n{action}\n\nBlock? YES/NO, lean YES."
+   }
+   ```
+
+Precedence per stage: `stage1Message` > `stage1Instruction` > default (and the
+same for stage 2). The shared system prompt, token budgets (`maxTokens` 5 / 700),
+JSON parsing, and the rest of the pipeline are unaffected. Run
+`/auto-mode reload` after editing the config file to pick up changes.
+
 ## Files
 
 - `package.json` — pi package manifest
