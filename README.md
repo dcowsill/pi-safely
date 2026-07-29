@@ -170,6 +170,8 @@ Example:
   "maxTotalDenials": 20,
   "maxTranscriptLines": 60,
   "reasoningEffort": "high",
+  "stage1MaxTokens": 1024,
+  "stage2MaxTokens": 4096,
   "allowlistedTools": ["read", "grep", "find", "ls"],
   "environment": [
     "**Trusted repo**: this repository and its configured remotes",
@@ -185,6 +187,15 @@ Example:
 - `classifierModel` is optional. If omitted, the extension uses the current active pi model.
 - For a cheap GitHub Copilot-backed classifier, `github-copilot/gpt-5.4-mini` is a good default.
 - The extension currently fails open by default, matching the reference repo's behavior when the classifier is unavailable.
+- `stage1MaxTokens` / `stage2MaxTokens` cap the classifier's completion budget
+  (defaults 1024 / 4096). They are caps, not targets — a non-reasoning model
+  still stops after `NO` or the JSON object, so larger budgets cost nothing
+  extra. **Reasoning classifiers (e.g. `openai/gpt-oss-safeguard-20b`) need
+  this headroom**: their reasoning tokens count against `max_tokens`, and a
+  too-small budget returns an empty response body, which auto-mode must block
+  conservatively. If Stage 2 is truncated (`stopReason: "length"`) it is
+  retried once at 4x budget before failing closed. Stage 1 always runs at
+  `reasoningEffort: "low"` regardless of the configured effort.
 
 ### Custom classifier user messages
 
@@ -216,9 +227,9 @@ default, but both can be overridden from config. There are two layers:
    ```
 
 Precedence per stage: `stage1Message` > `stage1Instruction` > default (and the
-same for stage 2). The shared system prompt, token budgets (`maxTokens` 5 / 700),
-JSON parsing, and the rest of the pipeline are unaffected. Run
-`/auto-mode reload` after editing the config file to pick up changes.
+same for stage 2). The shared system prompt, token budgets (`stage1MaxTokens` /
+`stage2MaxTokens`), JSON parsing, and the rest of the pipeline are unaffected.
+Run `/auto-mode reload` after editing the config file to pick up changes.
 
 ## Files
 

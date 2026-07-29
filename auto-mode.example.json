@@ -6,6 +6,8 @@
   "maxTotalDenials": 20,
   "maxTranscriptLines": 60,
   "reasoningEffort": "high",
+  "stage1MaxTokens": 1024,
+  "stage2MaxTokens": 4096,
   "allowlistedTools": ["read", "grep", "find", "ls"],
   "environment": [
     "**Trusted repo**: the repository pi started in and its configured git remotes",

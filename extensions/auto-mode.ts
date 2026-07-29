@@ -16,6 +16,8 @@ type AutoModeConfig = {
 	maxTotalDenials: number;
 	maxTranscriptLines: number;
 	reasoningEffort: ReasoningEffort;
+	stage1MaxTokens: number;
+	stage2MaxTokens: number;
 	allowlistedTools: string[];
 	environment: string[];
 	allowRules: string[];
@@ -59,6 +61,14 @@ const DEFAULT_CONFIG: AutoModeConfig = {
 	maxTotalDenials: 20,
 	maxTranscriptLines: 60,
 	reasoningEffort: "high",
+	// Token budgets are caps, not targets: non-reasoning models still stop after
+	// "NO"/the JSON object, so raising them costs nothing for cheap models. They
+	// must be large enough for reasoning classifiers (e.g. gpt-oss-safeguard),
+	// whose reasoning tokens count against max_tokens — a 5-token Stage 1 budget
+	// returns empty content 100% of the time on such models, and 700 tokens is
+	// not enough headroom for Stage 2 reasoning on complex actions.
+	stage1MaxTokens: 1024,
+	stage2MaxTokens: 4096,
 	allowlistedTools: ["read", "grep", "find", "ls"],
 	environment: [
 		"**Trusted repo**: the repository pi started in and its configured git remotes",
@@ -212,6 +222,14 @@ function mergeConfig(raw: Partial<AutoModeConfig> | null | undefined): AutoModeC
 			Array.isArray(raw?.denyRules) && raw.denyRules.length > 0
 				? raw.denyRules.map((value) => String(value))
 				: [...DEFAULT_CONFIG.denyRules],
+		stage1MaxTokens:
+			typeof raw?.stage1MaxTokens === "number" && raw.stage1MaxTokens > 0
+				? Math.floor(raw.stage1MaxTokens)
+				: DEFAULT_CONFIG.stage1MaxTokens,
+		stage2MaxTokens:
+			typeof raw?.stage2MaxTokens === "number" && raw.stage2MaxTokens > 0
+				? Math.floor(raw.stage2MaxTokens)
+				: DEFAULT_CONFIG.stage2MaxTokens,
 		stage1Instruction: typeof raw?.stage1Instruction === "string" ? raw.stage1Instruction : undefined,
 		stage2Instruction: typeof raw?.stage2Instruction === "string" ? raw.stage2Instruction : undefined,
 		stage1Message: typeof raw?.stage1Message === "string" ? raw.stage1Message : undefined,
@@ -624,6 +642,7 @@ async function runStage1(
 	headers: Record<string, string> | undefined,
 	systemPrompt: string,
 	userContent: string,
+	maxTokens: number,
 	signal: AbortSignal | undefined,
 ): Promise<boolean> {
 	const userMessage: UserMessage = {
@@ -632,10 +651,14 @@ async function runStage1(
 		timestamp: Date.now(),
 	};
 
+	// reasoningEffort "low": this is a YES/NO filter, and on reasoning models
+	// (gpt-oss-safeguard etc.) reasoning tokens count against max_tokens —
+	// without headroom the response body comes back empty and every action
+	// would fall through to Stage 2.
 	const response = await complete(
 		model,
 		{ systemPrompt, messages: [userMessage] },
-		{ apiKey, headers, signal, maxTokens: 5 },
+		{ apiKey, headers, signal, maxTokens, reasoningEffort: "low" },
 	);
 	const text = response.content
 		.filter((block): block is { type: "text"; text: string } => block.type === "text")
@@ -719,6 +742,7 @@ async function runStage2(
 	systemPrompt: string,
 	userContent: string,
 	reasoningEffort: ReasoningEffort,
+	maxTokens: number,
 	signal: AbortSignal | undefined,
 ): Promise<ClassificationResult> {
 	const userMessage: UserMessage = {
@@ -727,22 +751,46 @@ async function runStage2(
 		timestamp: Date.now(),
 	};
 
-	const response = await complete(
-		model,
-		{ systemPrompt, messages: [userMessage] },
-		{ apiKey, headers, signal, maxTokens: 700, reasoningEffort },
-	);
-	const text = response.content
-		.filter((block): block is { type: "text"; text: string } => block.type === "text")
-		.map((block) => block.text)
-		.join("\n");
+	// Reasoning classifiers can exhaust max_tokens on chain-of-thought before
+	// emitting any content (stopReason "length", empty text). Retry once with
+	// a 4x budget before failing closed, and report truncation distinctly so
+	// it is distinguishable from a genuinely malformed response.
+	let budget = maxTokens;
+	for (let attempt = 0; attempt < 2; attempt += 1) {
+		const response = await complete(
+			model,
+			{ systemPrompt, messages: [userMessage] },
+			{ apiKey, headers, signal, maxTokens: budget, reasoningEffort },
+		);
+		const text = response.content
+			.filter((block): block is { type: string; text?: string; content?: string } =>
+				!!block && typeof block === "object" && "type" in block,
+			)
+			.map((block) => block.text ?? block.content ?? "")
+			.filter((t) => t.length > 0)
+			.join("\n");
 
-	const parsed = tryParseJsonObject(text);
-	if (parsed) return parsed;
+		const parsed = tryParseJsonObject(text);
+		if (parsed) return parsed;
+
+		const truncated = response.stopReason === "length";
+		if (truncated && attempt === 0) {
+			budget = maxTokens * 4;
+			continue;
+		}
+		return {
+			shouldBlock: true,
+			reason: truncated
+				? "Classifier response was truncated (token budget exhausted, likely by reasoning); blocking conservatively."
+				: "Classifier returned an unparsable response; blocking conservatively.",
+			thinking: truncateMiddle(text, 1000),
+		};
+	}
+
+	// Unreachable, but satisfies the return-type checker.
 	return {
 		shouldBlock: true,
 		reason: "Classifier returned an unparsable response; blocking conservatively.",
-		thinking: truncateMiddle(text, 1000),
 	};
 }
 
@@ -1178,6 +1226,7 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 				classifier.headers,
 				systemPrompt,
 				stage1Content,
+				config.stage1MaxTokens,
 				ctx.signal,
 			);
 
@@ -1192,6 +1241,7 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 					systemPrompt,
 					stage2Content,
 					config.reasoningEffort,
+					config.stage2MaxTokens,
 					ctx.signal,
 				);
 			}
