@@ -1,6 +1,6 @@
 {
   "name": "pi-auto-mode",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A pi auto-mode extension with a TypeSafe Jev System One policy classifier.",
   "type": "module",
   "license": "MIT",
@@ -26,7 +26,12 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
   },
   "pi": {
     "extensions": ["./extensions"]

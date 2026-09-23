@@ -79,14 +79,9 @@ changes can still be proposed upstream independently.
 
 ## Compatibility note
 
-The package's `peerDependencies` and source imports reference the **old** pi package scope
-`@mariozechner/pi-coding-agent` and `@mariozechner/pi-tui`. This is
-**not** a bug and does **not** need fixing: pi's extension loader
-(`dist/core/extensions/loader.js`) maintains an alias map that resolves both
-`@mariozechner/*` and `@earendil-works/*` to the same bundled instances. So this extension
-loads cleanly against current `@earendil-works/pi-coding-agent` with no patching. Do not
-"fix" the imports to `@earendil-works/*` — that would break resolution against older pi
-installs that only have the `@mariozechner` scope.
+The published package targets the current `@earendil-works/pi-coding-agent` scope. Its
+peer dependency is optional because Pi supplies the coding-agent runtime to extensions;
+this prevents a git package install from downloading a redundant nested copy of Pi.
 
 ## Working in this repo
 

@@ -55,7 +55,7 @@ pi install https://git.armless.xyz/dan/pi-auto-mode.git
 You can also pin a ref:
 
 ```bash
-pi install https://git.armless.xyz/dan/pi-auto-mode.git@v0.2.0
+pi install https://git.armless.xyz/dan/pi-auto-mode.git@v0.2.1
 # or a tag / commit
 pi install https://git.armless.xyz/dan/pi-auto-mode.git@<tag-or-commit>
 ```
