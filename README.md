@@ -2,14 +2,19 @@
 
 A pi package that re-implements the core of Claude Code's auto mode for pi.
 
-It is modeled after [`lghupan/cc-automode`](https://github.com/lghupan/cc-automode):
+This is a fork of [`r4vi/pi-auto-mode`](https://github.com/r4vi/pi-auto-mode),
+with the original two-stage generative classifier replaced by TypeSafe Jev
+System One. The design is also modeled after
+[`lghupan/cc-automode`](https://github.com/lghupan/cc-automode).
+
+Features:
 
 - read-only tool allowlist fast path
 - deterministic hard-deny checks for obviously unsafe actions
-- two-stage classifier on every non-allowlisted tool call
+- TypeSafe Jev System One classifier on every non-allowlisted tool call
 - consecutive/total denial tracking
 - auto-mode execution guidance injected into pi's system prompt
-- denial history widget in the UI
+- on-demand denial history via `/auto-mode history`
 - user override prompt on denials
 
 ## What it does
@@ -28,9 +33,10 @@ When enabled, the extension intercepts tool calls in pi:
    - destructive deletes outside the workspace
    - SSH key injection
    - auto-mode self-modification
-3. everything else is classified with a two-stage LLM check:
-   - stage 1: cheap `YES` / `NO` filter
-   - stage 2: full JSON decision with reasoning only if stage 1 flags the action
+3. everything else is sent to TypeSafe Jev in one System One request:
+   - each configured deny rule becomes an independent Noul (yes/no probability)
+   - deterministic code blocks when any rule reaches `jevBlockThreshold`
+   - the denial reason names the strongest matching rule and its probability
 4. if a denial happens in interactive mode, pi asks you whether to:
    - block
    - allow once
@@ -38,34 +44,20 @@ When enabled, the extension intercepts tool calls in pi:
 
 ## Install
 
-### From npm
-
-Once published, the package can be installed from npm:
-
-```bash
-npm install pi-auto-mode
-```
-
-### Directly from GitHub
+### From Forgejo
 
 You do not need to clone the repo first.
 
 ```bash
-pi install git:github.com/r4vi/pi-auto-mode
+pi install https://git.armless.xyz/dan/pi-auto-mode.git
 ```
 
 You can also pin a ref:
 
 ```bash
-pi install git:github.com/r4vi/pi-auto-mode@main
+pi install https://git.armless.xyz/dan/pi-auto-mode.git@v0.2.0
 # or a tag / commit
-pi install git:github.com/r4vi/pi-auto-mode@<tag-or-commit>
-```
-
-Raw GitHub URLs work too:
-
-```bash
-pi install https://github.com/r4vi/pi-auto-mode
+pi install https://git.armless.xyz/dan/pi-auto-mode.git@<tag-or-commit>
 ```
 
 ### As a local package
@@ -90,21 +82,35 @@ Commands:
 
 ```text
 /auto-mode status
+/auto-mode history
 /auto-mode on
 /auto-mode off
 /auto-mode toggle
 /auto-mode reset
 /auto-mode reload
 /auto-mode model
-/auto-mode model github-copilot/gpt-5.4-mini
+/auto-mode model jev-1.13.0
 ```
 
-If no dedicated classifier model is configured, the extension prompts you to choose one when auto mode is enabled in interactive mode.
+### TypeSafe credential
+
+The extension registers an auth-only `typesafe` provider with Pi. It has no
+generative models and does not appear in the model picker. Store the dedicated
+Jev key through Pi's normal credential UI:
+
+```text
+/login
+```
+
+Choose **TypeSafe AI**, then enter the key. Pi stores it under `typesafe` in
+`~/.pi/agent/auth.json`, with the same locking and `0600` permissions used for
+other provider credentials. The extension retrieves it through Pi's model
+registry; it does not read `auth.json` directly and has no gopass dependency.
 
 ## UI additions
 
 - footer status for auto mode state
-- recent denial history widget below the editor
+- recent denial history available on demand with `/auto-mode history`
 - interactive override prompt when a denial happens
 
 ## Configuration
@@ -150,8 +156,6 @@ You can inspect the merged result with:
 /auto-mode status
 ```
 
-## Configuration
-
 Create either of these in the target project:
 
 - `.pi/auto-mode.json`
@@ -164,14 +168,14 @@ Example:
 ```json
 {
   "enabled": true,
-  "classifierModel": "github-copilot/gpt-5.4-mini",
   "failOpen": true,
   "maxConsecutiveDenials": 3,
   "maxTotalDenials": 20,
   "maxTranscriptLines": 60,
-  "reasoningEffort": "high",
-  "stage1MaxTokens": 1024,
-  "stage2MaxTokens": 4096,
+  "jevModel": "jev-1.13.0",
+  "jevBaseUrl": "https://api.typesafe.ai",
+  "jevBlockThreshold": 0.7,
+  "jevTimeoutMs": 10000,
   "allowlistedTools": ["read", "grep", "find", "ls"],
   "environment": [
     "**Trusted repo**: this repository and its configured remotes",
@@ -184,57 +188,22 @@ Example:
 
 ### Notes
 
-- `classifierModel` is optional. If omitted, the extension uses the current active pi model.
-- For a cheap GitHub Copilot-backed classifier, `github-copilot/gpt-5.4-mini` is a good default.
-- The extension currently fails open by default, matching the reference repo's behavior when the classifier is unavailable.
-- `stage1MaxTokens` / `stage2MaxTokens` cap the classifier's completion budget
-  (defaults 1024 / 4096). They are caps, not targets — a non-reasoning model
-  still stops after `NO` or the JSON object, so larger budgets cost nothing
-  extra. **Reasoning classifiers (e.g. `openai/gpt-oss-safeguard-20b`) need
-  this headroom**: their reasoning tokens count against `max_tokens`, and a
-  too-small budget returns an empty response body, which auto-mode must block
-  conservatively. If Stage 2 is truncated (`stopReason: "length"`) it is
-  retried once at 4x budget before failing closed. Stage 1 always runs at
-  `reasoningEffort: "low"` regardless of the configured effort.
-
-### Custom classifier user messages
-
-The stage-1 and stage-2 **user messages** sent to the classifier are hardcoded by
-default, but both can be overridden from config. There are two layers:
-
-1. **Instruction-only override** (recommended): set `stage1Instruction` and/or
-   `stage2Instruction` to replace just the trailing instruction text. The
-   transcript and action are still injected by the built-in scaffolding, so you
-   cannot accidentally drop context. Omitting a field keeps the default.
-
-   ```json
-   {
-     "stage1Instruction": "Should this action be blocked? Reply YES or NO. When in doubt, answer YES.",
-     "stage2Instruction": "Decide whether to block. Return JSON: {\"shouldBlock\": boolean, \"reason\": string}"
-   }
-   ```
-
-2. **Full template override** (escape hatch): set `stage1Message` and/or
-   `stage2Message` to replace the **entire** user message. Use the literal
-   tokens `{transcript}` and `{action}` where you want the transcript and action
-   substituted. A full template, if present, takes precedence over its
-   instruction counterpart.
-
-   ```json
-   {
-     "stage1Message": "## Transcript\n{transcript}\n\n## Proposed action\n{action}\n\nBlock? YES/NO, lean YES."
-   }
-   ```
-
-Precedence per stage: `stage1Message` > `stage1Instruction` > default (and the
-same for stage 2). The shared system prompt, token budgets (`stage1MaxTokens` /
-`stage2MaxTokens`), JSON parsing, and the rest of the pipeline are unaffected.
-Run `/auto-mode reload` after editing the config file to pick up changes.
+- `jevModel` is sent directly to TypeSafe's `/v1/systemone` endpoint.
+- `jevBlockThreshold` is inclusive: a deny-rule probability equal to the
+  threshold blocks.
+- `failOpen` controls missing credentials, timeouts, HTTP errors, and malformed
+  Jev responses. It remains `true` by default.
+- The request contains the working directory, recent user/assistant text,
+  assistant tool calls (never tool results), the proposed action, environment
+  description, allow exceptions, and the deny-rule questions.
+- Run `/auto-mode reload` after editing configuration outside Pi.
 
 ## Files
 
 - `package.json` — pi package manifest
 - `extensions/auto-mode.ts` — the extension
+- `src/jev-classifier.ts` — System One request, validation, and deterministic routing
+- `tests/jev-classifier.test.ts` — offline wire-format and routing tests
 - `auto-mode.example.json` — starter config
 
 ## Known gaps vs official Claude Code auto mode
@@ -243,11 +212,15 @@ This package mirrors the open-source reference architecture, not Anthropic's pri
 
 Current differences:
 
-- no server-side prompt-injection probe
-- no provider-side caching optimizations beyond what the selected model/provider already does
-- JSON parsing is used for stage 2 instead of a dedicated classifier tool call
+- no server-side transcript prompt-injection probe
+- no natural-language classifier explanation; reasons are derived from matched policy rules
 - policy is project-config based rather than Claude hook config based
 
 ## Development
 
-This package is intentionally dependency-light and relies on pi's extension runtime.
+This package is intentionally dependency-free beyond Pi's extension runtime and
+Node's built-in `fetch`. Run the offline classifier tests with:
+
+```bash
+npm test
+```

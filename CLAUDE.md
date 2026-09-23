@@ -1,8 +1,8 @@
 # CLAUDE.md
 
 This is a fork of [`r4vi/pi-auto-mode`](https://github.com/r4vi/pi-auto-mode) — a pi
-coding-agent extension that re-implements Claude Code's "auto mode" two-stage
-tool-call permission classifier for pi.
+coding-agent extension that implements Claude Code-style auto mode with a TypeSafe
+Jev System One tool-call policy classifier for pi.
 
 This file is the working rationale for our local fork. It exists so any agent (Claude
 Code, pi itself, or a delegate) working in this repo understands **why** this fork exists
@@ -11,20 +11,16 @@ and what conventions to follow.
 ## What pi-auto-mode is
 
 A pi extension (loaded as a pi package, entry at `extensions/auto-mode.ts`) that gates
-every non-allowlisted tool call through a two-stage LLM classifier before execution:
+every non-allowlisted tool call through one Jev System One request before execution.
+Each configured deny rule is represented by an independent Noul question. Pure code
+validates every answer and blocks when any probability reaches `jevBlockThreshold`.
+Tool results are stripped from the transcript. Denials return as tool results and the
+agent continues (deny-and-continue); 3 consecutive or 20 total denials per session
+pause/escalate.
 
-- **Stage 1** — a cheap single-token `YES`/`NO` filter (`maxTokens: 5`), biased toward
-  blocking ("err toward YES if uncertain"). High recall, ~8.5% false-positive rate.
-- **Stage 2** — chain-of-thought reasoning (`maxTokens: 700`, `reasoningEffort` from
-  config), runs **only** if Stage 1 flags. Returns JSON `{shouldBlock, reason, thinking}`.
-  Because the system prompt + transcript + action are byte-identical to Stage 1, this is
-  effectively a prompt-cache hit.
-
-Both stages share one hardcoded system prompt with three configurable slots
-(`<ENVIRONMENT>`, `<DENY_RULES>`, `<ALLOW_RULES>`). Tool *results* are stripped from the
-transcript (reasoning-blind — the structural prompt-injection defense). Denials return as
-tool results and the agent continues (deny-and-continue); 3 consecutive or 20 total
-denials per session pause/escalate.
+The TypeSafe key is stored through Pi's native `/login` flow as the auth-only provider
+`typesafe` in `~/.pi/agent/auth.json`. There is no gopass dependency and Jev is not
+registered as a generative model.
 
 It is modeled after [`lghupan/cc-automode`](https://github.com/lghupan/cc-automode).
 
@@ -64,47 +60,27 @@ This matches how pi itself treats user/global vs project-local resources, and ho
 > fix is narrowing the toggle paths to persist only the `enabled` field (or not
 > persist toggles at all) — open enhancement, not yet implemented.
 
-### 2. Configurable classifier prompts (planned — not yet implemented)
+### 2. Jev classifier backend
 
-The three prompt artifacts — the shared system prompt's fixed prose, the Stage 1 user
-message, and the Stage 2 user message + JSON schema — are **hardcoded constants** in
-`extensions/auto-mode.ts`:
-
-- `CLASSIFIER_SYSTEM_PROMPT` (10 principles + framing; slots are configurable, prose is not)
-- Stage 1 instruction: `"Should this action be blocked? Reply with only YES or NO. Err toward YES if uncertain."`
-- Stage 2 instruction: the JSON schema `{"shouldBlock", "reason", "thinking"}` + instruction
-- `AUTO_MODE_GUIDANCE` (the block injected into the *agent's* system prompt via `before_agent_start`)
-
-Only the three slots (`environment`, `denyRules`, `allowRules`) and `reasoningEffort` /
-`classifierModel` / `maxTranscriptLines` are user-configurable. The bias wording, the 10
-principles, the token budgets, and the Stage 2 JSON shape are fixed.
-
-**Goal:** add optional config fields (e.g. `systemPrompt`, `stage1Instruction`,
-`stage2Instruction`, `agentGuidance`) that override the constants when present, falling
-back to the hardcoded defaults otherwise. This lets us tune Stage-1 bias, swap the JSON
-schema, or customize the principles per project without forking the prose.
-
-> **Status (2026-07-02):** the **user-message** portion is implemented — optional
-> config fields `stage1Instruction` / `stage2Instruction` (instruction-only override,
-> recommended) and `stage1Message` / `stage2Message` (full-template escape hatch with
-> `{transcript}` / `{action}` tokens; wins if present). See `buildStage1UserMessage` /
-> `buildStage2UserMessage` in `extensions/auto-mode.ts`. The remaining artifacts — the
-> shared classifier **system prompt** prose (`systemPrompt`) and the **agent guidance**
-> injection (`agentGuidance`) — are still hardcoded and deferred.
+The upstream two-stage generative classifier has been removed. `src/jev-classifier.ts`
+builds one Noul per deny rule, posts the request to `/v1/systemone`, validates the full
+answer map, and derives a deterministic result. The active model, endpoint, threshold,
+and timeout are configured with `jevModel`, `jevBaseUrl`, `jevBlockThreshold`, and
+`jevTimeoutMs`.
 
 ## Remotes
 
-- `origin` → `github.com/dcowsill/pi-auto-mode` (our fork; push here)
+- `forgejo` → `git.armless.xyz/dan/pi-auto-mode` (canonical public release repository)
+- `origin` → `github.com/dcowsill/pi-auto-mode` (historical GitHub fork)
 - `upstream` → `github.com/r4vi/pi-auto-mode` (track and pull upstream changes)
 
-Working branch: `dcowsill/main`. Keep commits focused; we want clean PRs back to upstream
-where the changes are generally useful (the global-config patch is a good upstream PR
-candidate; highly custom prompt tuning may stay fork-only).
+Publish the Forgejo repository from `main`. Keep commits focused so generally useful
+changes can still be proposed upstream independently.
 
 ## Compatibility note
 
 The package's `peerDependencies` and source imports reference the **old** pi package scope
-`@mariozechner/pi-ai`, `@mariozechner/pi-coding-agent`, `@mariozechner/pi-tui`. This is
+`@mariozechner/pi-coding-agent` and `@mariozechner/pi-tui`. This is
 **not** a bug and does **not** need fixing: pi's extension loader
 (`dist/core/extensions/loader.js`) maintains an alias map that resolves both
 `@mariozechner/*` and `@earendil-works/*` to the same bundled instances. So this extension
@@ -126,16 +102,13 @@ installs that only have the `@mariozechner` scope.
   path, `echo x >> ~/.ssh/authorized_keys` triggers the SSH-key-injection regex
   regardless of model. Beware: an agent may refuse to *attempt* a `write` to
   `~/.ssh/authorized_keys` on its own judgement, which exercises nothing — use the bash
-  redirect form so the hard-deny regex actually fires.
+  redirect form so the hard-deny regex actually fires. The Jev path additionally requires
+  a TypeSafe key installed through `/login`; run `npm test` for offline routing coverage.
 - **Config for testing:** `~/.pi/auto-mode.json` (global) or `<cwd>/.pi/auto-mode.json`
   (project). The shipped `auto-mode.example.json` documents all fields. Mind the
   cross-session clobber race described under item 1 above — after hand-editing the file,
   run `/auto-mode reload` in any active session so its in-memory copy syncs and doesn't
   overwrite your edit on its next `saveConfig`.
-- **Don't** start implementing the remaining configurable prompts (the shared classifier
-  system prompt or `agentGuidance`; item 2 above) unless explicitly asked — that work is
-  earmarked for a delegated agent. The user-message overrides (stage1/stage2 instructions
-  and full templates) are already implemented.
 
 ## Reference
 

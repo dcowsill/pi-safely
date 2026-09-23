@@ -1,28 +1,31 @@
 {
   "name": "pi-auto-mode",
-  "version": "0.1.2",
-  "description": "A pi extension that re-implements Claude Code style auto mode with a two-stage tool-call classifier.",
+  "version": "0.2.0",
+  "description": "A pi auto-mode extension with a TypeSafe Jev System One policy classifier.",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/r4vi/pi-auto-mode.git"
+    "url": "git+https://git.armless.xyz/dan/pi-auto-mode.git"
   },
-  "homepage": "https://github.com/r4vi/pi-auto-mode#readme",
+  "homepage": "https://git.armless.xyz/dan/pi-auto-mode",
   "bugs": {
-    "url": "https://github.com/r4vi/pi-auto-mode/issues"
+    "url": "https://git.armless.xyz/dan/pi-auto-mode/issues"
   },
   "keywords": ["pi-package"],
   "files": [
     "extensions",
+    "src",
     "README.md",
     "auto-mode.example.json"
   ],
+  "scripts": {
+    "test": "node tests/jev-classifier.test.ts"
+  },
   "publishConfig": {
     "access": "public"
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*"
   },
   "pi": {

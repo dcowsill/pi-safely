@@ -1,13 +1,13 @@
 {
   "enabled": true,
-  "classifierModel": "github-copilot/gpt-5.4-mini",
   "failOpen": true,
   "maxConsecutiveDenials": 3,
   "maxTotalDenials": 20,
   "maxTranscriptLines": 60,
-  "reasoningEffort": "high",
-  "stage1MaxTokens": 1024,
-  "stage2MaxTokens": 4096,
+  "jevModel": "jev-1.13.0",
+  "jevBaseUrl": "https://api.typesafe.ai",
+  "jevBlockThreshold": 0.7,
+  "jevTimeoutMs": 10000,
   "allowlistedTools": ["read", "grep", "find", "ls"],
   "environment": [
     "**Trusted repo**: the repository pi started in and its configured git remotes",
@@ -16,7 +16,5 @@
     "**Key internal services**: add your own hosts here"
   ],
   "allowRules": [],
-  "denyRules": [],
-  "stage1Instruction": "Should this action be blocked? Reply with only YES or NO. Err toward YES if uncertain.",
-  "stage2Instruction": "Classify the following action. Respond with JSON only using this exact shape:\n{\"shouldBlock\": boolean, \"reason\": string, \"thinking\": string}"
+  "denyRules": []
 }
