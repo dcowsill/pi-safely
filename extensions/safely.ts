@@ -1,19 +1,25 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { classifyWithJev } from "../src/jev-classifier.ts";
+import {
+	classifyWithSystemOne,
+	isSystemOneProvider,
+	SYSTEM_ONE_PROVIDERS,
+	type SystemOneProvider,
+} from "../src/system-one-classifier.ts";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import os from "node:os";
 
-type AutoModeConfig = {
+type SafelyConfig = {
 	enabled: boolean;
 	failOpen: boolean;
 	maxConsecutiveDenials: number;
 	maxTotalDenials: number;
 	maxTranscriptLines: number;
-	jevModel: string;
-	jevBaseUrl: string;
-	jevBlockThreshold: number;
-	jevTimeoutMs: number;
+	provider: SystemOneProvider;
+	model: string;
+	baseUrl: string;
+	blockThreshold: number;
+	timeoutMs: number;
 	allowlistedTools: string[];
 	environment: string[];
 	allowRules: string[];
@@ -24,11 +30,11 @@ type DenialRecord = {
 	timestamp: number;
 	toolName: string;
 	reason: string;
-	kind: "hard-deny" | "jev" | "classifier" | "quota" | "setup";
+	kind: "hard-deny" | "classifier" | "quota" | "setup";
 	overridden?: boolean;
 };
 
-type AutoModeState = {
+type SafelyState = {
 	enabled: boolean;
 	consecutiveDenials: number;
 	totalDenials: number;
@@ -39,16 +45,19 @@ type AutoModeState = {
 	recentDenials: DenialRecord[];
 };
 
-const DEFAULT_CONFIG: AutoModeConfig = {
+const DEFAULT_PROVIDER: SystemOneProvider = "openrouter";
+
+const DEFAULT_CONFIG: SafelyConfig = {
 	enabled: true,
 	failOpen: true,
 	maxConsecutiveDenials: 3,
 	maxTotalDenials: 20,
 	maxTranscriptLines: 60,
-	jevModel: "jev-1.13.0",
-	jevBaseUrl: "https://api.typesafe.ai",
-	jevBlockThreshold: 0.7,
-	jevTimeoutMs: 10_000,
+	provider: DEFAULT_PROVIDER,
+	model: SYSTEM_ONE_PROVIDERS[DEFAULT_PROVIDER].defaultModel,
+	baseUrl: SYSTEM_ONE_PROVIDERS[DEFAULT_PROVIDER].baseUrl,
+	blockThreshold: 0.7,
+	timeoutMs: 10_000,
 	allowlistedTools: ["read", "grep", "find", "ls"],
 	environment: [
 		"**Trusted repo**: the repository pi started in and its configured git remotes",
@@ -90,7 +99,7 @@ const DEFAULT_CONFIG: AutoModeConfig = {
 		"Exfil Scouting: probing untrusted endpoints or encoding tricks to discover what external services are reachable.",
 		"Untrusted Code Integration: pulling executable code from untrusted repos, registries, or services and arranging for it to run.",
 		"Unauthorized Persistence: adding SSH keys, modifying shell profiles, creating cron jobs, or creating long-lived background persistence.",
-		"Self-Modification: modifying auto-mode configuration, extension files, or other files that define the agent's own safety controls.",
+		"Self-Modification: modifying pi-safely/auto-mode configuration, extension files, or other files that define the agent's own safety controls.",
 		"Trusting Guessed External Services: sending internal or sensitive data to an external service the agent guessed rather than one the user explicitly established as trusted.",
 		"External System Writes: mass-modifying or closing items in collaboration tools, ticketing systems, issue trackers, or external APIs that the agent did not create in this session.",
 		"Content Integrity / Impersonation: posting or updating content that is fabricated, misleading, or claims actions/approvals that did not happen.",
@@ -106,13 +115,19 @@ Auto mode is active. The user chose continuous, autonomous execution.
 - Minimize interruptions and make reasonable assumptions.
 - Be thorough: complete implementation, verification, and cleanup.
 - Never post content to public services without explicit approval for that exact endpoint.
-- Do not modify shell profile files, cron, TLS verification settings, or auto-mode's own safety files.`;
+- Do not modify shell profile files, cron, TLS verification settings, or pi-safely's own safety files.`;
 
 const HOME = os.homedir();
-const TYPESAFE_PROVIDER = "typesafe";
-const GLOBAL_CONFIG_PATH = resolve(HOME, ".pi", "auto-mode.json");
-const DEFAULT_CONFIG_RELATIVE_PATH = ".pi/auto-mode.json";
-const CONFIG_SUFFIXES = [DEFAULT_CONFIG_RELATIVE_PATH, "auto-mode.json"];
+const STATE_ENTRY_TYPE = "safely-state";
+const LEGACY_STATE_ENTRY_TYPE = "auto-mode-state";
+// Config file names in precedence order within a scope. The auto-mode names are read
+// only as a fallback for configs inherited from pi-auto-mode; writes always target the
+// pi-safely name in the same scope (see getConfigWritePath).
+const CONFIG_RELATIVE_PATHS = [".pi/safely.json", "safely.json"];
+const LEGACY_CONFIG_RELATIVE_PATHS = [".pi/auto-mode.json", "auto-mode.json"];
+const ALL_CONFIG_RELATIVE_PATHS = [...CONFIG_RELATIVE_PATHS, ...LEGACY_CONFIG_RELATIVE_PATHS];
+const GLOBAL_CONFIG_PATH = resolve(HOME, ".pi", "safely.json");
+const LEGACY_GLOBAL_CONFIG_PATH = resolve(HOME, ".pi", "auto-mode.json");
 const PROFILE_PATHS = new Set(
 	[
 		".bashrc",
@@ -139,8 +154,35 @@ const HARD_DENY_BASH_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
 	{ pattern: />>?\s*~\/\.ssh\/authorized_keys\b/i, reason: "SSH key injection" },
 ];
 
-function mergeConfig(raw: Partial<AutoModeConfig> | null | undefined): AutoModeConfig {
-	return {
+// Field names inherited from pi-auto-mode's Jev-only config. Still accepted on read.
+type LegacyConfigFields = {
+	jevModel?: unknown;
+	jevBaseUrl?: unknown;
+	jevBlockThreshold?: unknown;
+	jevTimeoutMs?: unknown;
+};
+
+type RawConfig = Partial<Record<keyof SafelyConfig, unknown>> & LegacyConfigFields;
+
+function nonEmptyString(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+export function mergeConfig(input: Partial<SafelyConfig> | null | undefined): SafelyConfig {
+	const raw = input as RawConfig | null | undefined;
+	// A legacy config that only carries jev* fields predates provider selection and
+	// always meant TypeSafe, so infer that instead of silently switching it to OpenRouter.
+	const hasLegacyJevFields = raw?.jevModel !== undefined || raw?.jevBaseUrl !== undefined;
+	const rawProvider = raw?.provider;
+	const provider: SystemOneProvider = isSystemOneProvider(rawProvider)
+		? rawProvider
+		: hasLegacyJevFields
+			? "typesafe"
+			: DEFAULT_PROVIDER;
+	const providerDefaults = SYSTEM_ONE_PROVIDERS[provider];
+	const blockThreshold = typeof raw?.blockThreshold === "number" ? raw.blockThreshold : raw?.jevBlockThreshold;
+	const timeoutMs = typeof raw?.timeoutMs === "number" ? raw.timeoutMs : raw?.jevTimeoutMs;
+	const config = {
 		enabled: typeof raw?.enabled === "boolean" ? raw.enabled : DEFAULT_CONFIG.enabled,
 		failOpen: typeof raw?.failOpen === "boolean" ? raw.failOpen : DEFAULT_CONFIG.failOpen,
 		maxConsecutiveDenials:
@@ -171,51 +213,63 @@ function mergeConfig(raw: Partial<AutoModeConfig> | null | undefined): AutoModeC
 			Array.isArray(raw?.denyRules) && raw.denyRules.length > 0
 				? raw.denyRules.map((value) => String(value))
 				: [...DEFAULT_CONFIG.denyRules],
-		jevModel:
-			typeof raw?.jevModel === "string" && raw.jevModel.trim()
-				? raw.jevModel.trim()
-				: DEFAULT_CONFIG.jevModel,
-		jevBaseUrl:
-			typeof raw?.jevBaseUrl === "string" && raw.jevBaseUrl.trim()
-				? raw.jevBaseUrl.trim().replace(/\/+$/, "")
-				: DEFAULT_CONFIG.jevBaseUrl,
-		jevBlockThreshold:
-			typeof raw?.jevBlockThreshold === "number" && raw.jevBlockThreshold >= 0 && raw.jevBlockThreshold <= 1
-				? raw.jevBlockThreshold
-				: DEFAULT_CONFIG.jevBlockThreshold,
-		jevTimeoutMs:
-			typeof raw?.jevTimeoutMs === "number" && raw.jevTimeoutMs > 0
-				? Math.floor(raw.jevTimeoutMs)
-				: DEFAULT_CONFIG.jevTimeoutMs,
+		provider,
+		model: nonEmptyString(raw?.model) ?? nonEmptyString(raw?.jevModel) ?? providerDefaults.defaultModel,
+		baseUrl: (nonEmptyString(raw?.baseUrl) ?? nonEmptyString(raw?.jevBaseUrl) ?? providerDefaults.baseUrl).replace(/\/+$/, ""),
+		blockThreshold:
+			typeof blockThreshold === "number" && blockThreshold >= 0 && blockThreshold <= 1
+				? blockThreshold
+				: DEFAULT_CONFIG.blockThreshold,
+		timeoutMs:
+			typeof timeoutMs === "number" && timeoutMs > 0
+				? Math.floor(timeoutMs)
+				: DEFAULT_CONFIG.timeoutMs,
 	};
+	return config as SafelyConfig;
 }
 
-function getConfigPath(cwd: string): string {
-	// Project-local config takes precedence.
-	for (const suffix of CONFIG_SUFFIXES) {
-		const path = resolve(cwd, suffix);
+/** The config file currently in effect, or undefined when built-in defaults apply. */
+function getConfigPath(cwd: string): string | undefined {
+	// Project-local config takes precedence over global; within a scope, pi-safely
+	// names take precedence over legacy pi-auto-mode names.
+	for (const relativePath of ALL_CONFIG_RELATIVE_PATHS) {
+		const path = resolve(cwd, relativePath);
 		if (existsSync(path)) return path;
 	}
-	// Global fallback (~/.pi/auto-mode.json) so auto-mode can be configured once
-	// for all projects. Per-project files still override this.
-	if (existsSync(GLOBAL_CONFIG_PATH)) return GLOBAL_CONFIG_PATH;
-	return resolve(cwd, DEFAULT_CONFIG_RELATIVE_PATH);
+	// Global fallback so pi-safely can be configured once for all projects.
+	for (const path of [GLOBAL_CONFIG_PATH, LEGACY_GLOBAL_CONFIG_PATH]) {
+		if (existsSync(path)) return path;
+	}
+	return undefined;
 }
 
-function loadConfig(cwd: string): AutoModeConfig {
+/**
+ * Where saveConfig writes: the pi-safely-named file in the same scope as the config in
+ * effect. Saving over a legacy auto-mode.json therefore migrates it to safely.json
+ * (which then takes precedence) and leaves the legacy file untouched.
+ */
+function getConfigWritePath(cwd: string): string {
+	const current = getConfigPath(cwd);
+	if (!current) return resolve(cwd, CONFIG_RELATIVE_PATHS[0]);
+	if (current === LEGACY_GLOBAL_CONFIG_PATH) return GLOBAL_CONFIG_PATH;
+	const legacyIndex = LEGACY_CONFIG_RELATIVE_PATHS.findIndex((relativePath) => current === resolve(cwd, relativePath));
+	return legacyIndex === -1 ? current : resolve(cwd, CONFIG_RELATIVE_PATHS[legacyIndex]);
+}
+
+function loadConfig(cwd: string): SafelyConfig {
 	const path = getConfigPath(cwd);
-	if (!existsSync(path)) return { ...DEFAULT_CONFIG };
+	if (!path) return { ...DEFAULT_CONFIG };
 
 	try {
-		const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<AutoModeConfig>;
+		const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<SafelyConfig>;
 		return mergeConfig(parsed);
 	} catch {
 		return { ...DEFAULT_CONFIG };
 	}
 }
 
-function saveConfig(cwd: string, config: AutoModeConfig): void {
-	const path = getConfigPath(cwd);
+function saveConfig(cwd: string, config: SafelyConfig): void {
+	const path = getConfigWritePath(cwd);
 	mkdirSync(dirname(path), { recursive: true });
 	writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
@@ -365,7 +419,7 @@ function getClaudeGlobalAllowlistedTools(): string[] {
 	return readClaudeAllowlistedTools(GLOBAL_CLAUDE_SETTINGS_FILES);
 }
 
-function getEffectiveAllowlistedTools(cwd: string, config: AutoModeConfig): string[] {
+function getEffectiveAllowlistedTools(cwd: string, config: SafelyConfig): string[] {
 	const tools = new Set<string>();
 	for (const tool of config.allowlistedTools) {
 		const normalized = normalizeAllowlistedToolEntry(tool);
@@ -386,13 +440,13 @@ function resolveToolPath(cwd: string, inputPath: unknown): string | undefined {
 	return resolve(cwd, raw);
 }
 
-function isAutoModeControlFile(path: string, cwd: string): boolean {
+function isSafetyControlFile(path: string, cwd: string): boolean {
 	const normalized = path.replace(/\\/g, "/");
-	if (CONFIG_SUFFIXES.some((suffix) => normalized.endsWith(suffix))) return true;
+	if (ALL_CONFIG_RELATIVE_PATHS.some((relativePath) => normalized.endsWith(`/${relativePath}`))) return true;
 	if (!normalized.includes("/.pi/extensions/")) return false;
 	const file = basename(normalized).toLowerCase();
-	const root = resolve(cwd, "pi-auto-mode").replace(/\\/g, "/");
-	return file.includes("auto-mode") || normalized.startsWith(root);
+	const roots = ["pi-safely", "pi-auto-mode"].map((name) => resolve(cwd, name).replace(/\\/g, "/"));
+	return file.includes("safely") || file.includes("auto-mode") || roots.some((root) => normalized.startsWith(root));
 }
 
 function checkHardDeny(toolName: string, input: Record<string, unknown>, cwd: string): string | undefined {
@@ -408,7 +462,7 @@ function checkHardDeny(toolName: string, input: Record<string, unknown>, cwd: st
 		if (!resolvedPath) return undefined;
 		if (PROFILE_PATHS.has(resolvedPath) || SYSTEM_PROFILE_PATHS.has(resolvedPath)) return "shell profile modification";
 		if (resolvedPath === resolve(HOME, ".ssh/authorized_keys")) return "SSH key injection";
-		if (isAutoModeControlFile(resolvedPath, cwd)) return "auto-mode self-modification";
+		if (isSafetyControlFile(resolvedPath, cwd)) return "pi-safely self-modification";
 	}
 
 	return undefined;
@@ -418,9 +472,9 @@ function formatAction(toolName: string, input: Record<string, unknown>): string 
 	return `${toolName} ${safeJson(input, 6000)}`;
 }
 
-function buildJevState(
+function buildClassifierState(
 	ctx: ExtensionContext,
-	config: AutoModeConfig,
+	config: SafelyConfig,
 	transcript: string,
 	action: string,
 ): Record<string, unknown> {
@@ -443,11 +497,12 @@ function buildJevState(
 	};
 }
 
-function restoreState(ctx: ExtensionContext, enabledDefault: boolean): AutoModeState {
+function restoreState(ctx: ExtensionContext, enabledDefault: boolean): SafelyState {
 	const entries = ctx.sessionManager.getEntries();
 	for (let i = entries.length - 1; i >= 0; i -= 1) {
-		const entry = entries[i] as { type: string; customType?: string; data?: Partial<AutoModeState> };
-		if (entry.type !== "custom" || entry.customType !== "auto-mode-state" || !entry.data) continue;
+		const entry = entries[i] as { type: string; customType?: string; data?: Partial<SafelyState> };
+		if (entry.type !== "custom" || !entry.data) continue;
+		if (entry.customType !== STATE_ENTRY_TYPE && entry.customType !== LEGACY_STATE_ENTRY_TYPE) continue;
 		return {
 			enabled: entry.data.enabled ?? enabledDefault,
 			consecutiveDenials: entry.data.consecutiveDenials ?? 0,
@@ -470,24 +525,29 @@ function restoreState(ctx: ExtensionContext, enabledDefault: boolean): AutoModeS
 	};
 }
 
-function formatStatus(state: AutoModeState, config: AutoModeConfig): string {
-	if (!state.enabled) return "auto off";
+function formatStatus(state: SafelyState, config: SafelyConfig): string {
+	if (!state.enabled) return "safely off";
 	if (state.totalDenials > 0 || state.overrideCount > 0) {
-		return `auto ${state.consecutiveDenials}/${config.maxConsecutiveDenials} • ${state.totalDenials}/${config.maxTotalDenials} • override:${state.overrideCount}`;
+		return `safely ${state.consecutiveDenials}/${config.maxConsecutiveDenials} • ${state.totalDenials}/${config.maxTotalDenials} • override:${state.overrideCount}`;
 	}
-	return "auto on";
+	return "safely on";
 }
 
-function statusText(state: AutoModeState, config: AutoModeConfig, cwd: string, hasCredential: boolean): string {
+function credentialHint(provider: SystemOneProvider): string {
+	return `run /login and choose ${provider === "typesafe" ? "TypeSafe AI" : "OpenRouter"}`;
+}
+
+function statusText(state: SafelyState, config: SafelyConfig, cwd: string, hasCredential: boolean): string {
 	const configuredAllowlist = config.allowlistedTools.join(", ");
 	const claudeProjectAllowlist = getClaudeProjectAllowlistedTools(cwd);
 	const claudeGlobalAllowlist = getClaudeGlobalAllowlistedTools();
 	const effectiveAllowlist = getEffectiveAllowlistedTools(cwd, config);
 	return [
 		`enabled: ${state.enabled ? "yes" : "no"}`,
-		`classifier: ${TYPESAFE_PROVIDER}/${config.jevModel}`,
-		`TypeSafe credential: ${hasCredential ? "configured" : "missing (run /login)"}`,
-		`Jev block threshold: ${config.jevBlockThreshold.toFixed(2)}`,
+		`classifier: ${config.provider}/${config.model}`,
+		`endpoint: ${config.baseUrl}/v1/systemone`,
+		`${SYSTEM_ONE_PROVIDERS[config.provider].label} credential: ${hasCredential ? "configured" : `missing (${credentialHint(config.provider)})`}`,
+		`block threshold: ${config.blockThreshold.toFixed(2)}`,
 		`consecutive denials: ${state.consecutiveDenials}/${config.maxConsecutiveDenials}`,
 		`total denials: ${state.totalDenials}/${config.maxTotalDenials}`,
 		`overrides: ${state.overrideCount}`,
@@ -497,16 +557,17 @@ function statusText(state: AutoModeState, config: AutoModeConfig, cwd: string, h
 		`configured allowlisted tools: ${configuredAllowlist || "(none)"}`,
 		`claude project allowlisted tools: ${claudeProjectAllowlist.join(", ") || "(none)"}`,
 		`claude global allowlisted tools: ${claudeGlobalAllowlist.join(", ") || "(none)"}`,
+		`config file: ${getConfigPath(cwd) ?? "(none, using built-in defaults)"}`,
 		`effective allowlisted tools: ${effectiveAllowlist.join(", ") || "(none)"}`,
 	].join("\n");
 }
 
-function pushDenial(state: AutoModeState, denial: DenialRecord): void {
+function pushDenial(state: SafelyState, denial: DenialRecord): void {
 	state.recentDenials = [...state.recentDenials.slice(-7), denial];
 }
 
-function denialHistoryText(state: AutoModeState): string {
-	if (state.recentDenials.length === 0) return "No auto-mode denials recorded in this session.";
+function denialHistoryText(state: SafelyState): string {
+	if (state.recentDenials.length === 0) return "No pi-safely denials recorded in this session.";
 
 	return [...state.recentDenials]
 		.reverse()
@@ -546,26 +607,26 @@ async function promptDenialOverride(
 	actionSummary: string,
 ): Promise<"block" | "allow-once" | "disable-and-allow"> {
 	if (!ctx.hasUI) return "block";
-	herdrBlockStart(`Auto mode denied ${toolName}`);
+	herdrBlockStart(`pi-safely denied ${toolName}`);
 	let choice: string | undefined;
 	try {
 		choice = await ctx.ui.select(
-			`Auto mode denied ${toolName}\n\nReason:\n${truncateMiddle(reason, 500)}\n\nAction:\n${truncateMiddle(actionSummary, 800)}\n\nWhat do you want to do?`,
-			["Block", "Allow once", "Disable auto mode + allow"],
+			`pi-safely denied ${toolName}\n\nReason:\n${truncateMiddle(reason, 500)}\n\nAction:\n${truncateMiddle(actionSummary, 800)}\n\nWhat do you want to do?`,
+			["Block", "Allow once", "Disable pi-safely + allow"],
 		);
 	} finally {
 		herdrBlockEnd();
 	}
 
 	if (choice === "Allow once") return "allow-once";
-	if (choice === "Disable auto mode + allow") return "disable-and-allow";
+	if (choice === "Disable pi-safely + allow") return "disable-and-allow";
 	return "block";
 }
 
 async function finalizeDeniedAction(
 	ctx: ExtensionContext,
-	config: AutoModeConfig,
-	state: AutoModeState,
+	config: SafelyConfig,
+	state: SafelyState,
 	denial: DenialRecord,
 	actionSummary: string,
 	persistState: () => void,
@@ -593,8 +654,8 @@ async function finalizeDeniedAction(
 		updateUi();
 		ctx.ui.notify(
 			overrideDecision === "disable-and-allow"
-				? "Auto mode disabled and this action was allowed once"
-				: "Auto mode override: action allowed once",
+				? "pi-safely disabled and this action was allowed once"
+				: "pi-safely override: action allowed once",
 			"warning",
 		);
 		return undefined;
@@ -608,35 +669,36 @@ async function finalizeDeniedAction(
 	if (denial.kind === "quota") {
 		return {
 			block: true,
-			reason: `[auto-mode] Session paused: reached ${config.maxTotalDenials} blocked actions. Last reason: ${denial.reason}`,
+			reason: `[safely] Session paused: reached ${config.maxTotalDenials} blocked actions. Last reason: ${denial.reason}`,
 		};
 	}
 
 	if (state.consecutiveDenials >= config.maxConsecutiveDenials) {
 		return {
 			block: true,
-			reason: `[auto-mode] PAUSED after ${config.maxConsecutiveDenials} consecutive blocks. Last reason: ${denial.reason}. Total blocks: ${state.totalDenials}/${config.maxTotalDenials}.`,
+			reason: `[safely] PAUSED after ${config.maxConsecutiveDenials} consecutive blocks. Last reason: ${denial.reason}. Total blocks: ${state.totalDenials}/${config.maxTotalDenials}.`,
 		};
 	}
 
 	return {
 		block: true,
-		reason: `[auto-mode] Blocked (${state.consecutiveDenials}/${config.maxConsecutiveDenials} consecutive, ${state.totalDenials}/${config.maxTotalDenials} total): ${denial.reason}`,
+		reason: `[safely] Blocked (${state.consecutiveDenials}/${config.maxConsecutiveDenials} consecutive, ${state.totalDenials}/${config.maxTotalDenials} total): ${denial.reason}`,
 	};
 }
 
-export default function autoModeExtension(pi: ExtensionAPI) {
+export default function safelyExtension(pi: ExtensionAPI) {
 	extensionApi = pi;
 	// Auth-only provider: no Jev entry is exposed in the generative model picker,
-	// but /login can persist its dedicated API key in Pi's native auth.json.
-	pi.registerProvider(TYPESAFE_PROVIDER, {
+	// but /login can persist a dedicated TypeSafe key in Pi's native auth.json.
+	// OpenRouter needs no registration; Pi ships it as a built-in provider.
+	pi.registerProvider("typesafe", {
 		name: "TypeSafe AI",
 		apiKey: "$TYPESAFE_API_KEY",
 		models: [],
 	});
 
 	let config = { ...DEFAULT_CONFIG };
-	let state: AutoModeState = {
+	let state: SafelyState = {
 		enabled: true,
 		consecutiveDenials: 0,
 		totalDenials: 0,
@@ -645,7 +707,7 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 		recentDenials: [],
 	};
 	function persistState(): void {
-		pi.appendEntry("auto-mode-state", state);
+		pi.appendEntry(STATE_ENTRY_TYPE, state);
 	}
 
 	function recordDenial(denial: DenialRecord): void {
@@ -660,15 +722,19 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 				: state.totalDenials > 0 || state.overrideCount > 0
 					? ctx.ui.theme.fg("warning", text)
 					: ctx.ui.theme.fg("accent", text);
-			ctx.ui.setStatus("auto-mode", styled);
+			ctx.ui.setStatus("safely", styled);
 		}
+	}
+
+	async function getClassifierApiKey(ctx: ExtensionContext): Promise<string | undefined> {
+		return await ctx.modelRegistry.getApiKeyForProvider(config.provider);
 	}
 
 	async function maybeWarnMissingCredential(ctx: ExtensionContext): Promise<void> {
 		if (!state.enabled || !ctx.hasUI) return;
-		const apiKey = await ctx.modelRegistry.getApiKeyForProvider(TYPESAFE_PROVIDER);
-		if (!apiKey) {
-			ctx.ui.notify("Auto mode needs a TypeSafe AI key. Run /login and choose TypeSafe AI.", "warning");
+		if (!(await getClassifierApiKey(ctx))) {
+			const { label } = SYSTEM_ONE_PROVIDERS[config.provider];
+			ctx.ui.notify(`pi-safely needs a ${label} key: ${credentialHint(config.provider)}.`, "warning");
 		}
 	}
 
@@ -686,8 +752,10 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 		};
 	});
 
-	pi.registerCommand("auto-mode", {
-		description: "Control auto mode: status, history, on, off, toggle, reset, reload, model",
+	const usage = `Usage: /safely [status|history|on|off|toggle|reset|reload|provider [${Object.keys(SYSTEM_ONE_PROVIDERS).join("|")}]|model [model-id]]`;
+
+	pi.registerCommand("safely", {
+		description: "Control pi-safely: status, history, on, off, toggle, reset, reload, provider, model",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			const [subcommand, ...rest] = trimmed.split(/\s+/).filter(Boolean);
@@ -695,7 +763,7 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 			const remainder = rest.join(" ").trim();
 
 			if (command === "status") {
-				const apiKey = await ctx.modelRegistry.getApiKeyForProvider(TYPESAFE_PROVIDER);
+				const apiKey = await getClassifierApiKey(ctx);
 				ctx.ui.notify(statusText(state, config, ctx.cwd, Boolean(apiKey)), "info");
 				return;
 			}
@@ -712,7 +780,7 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 				persistState();
 				updateUi(ctx);
 				await maybeWarnMissingCredential(ctx);
-				ctx.ui.notify("Auto mode enabled", "info");
+				ctx.ui.notify("pi-safely enabled", "info");
 				return;
 			}
 
@@ -722,7 +790,7 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 				saveConfig(ctx.cwd, config);
 				persistState();
 				updateUi(ctx);
-				ctx.ui.notify("Auto mode disabled", "warning");
+				ctx.ui.notify("pi-safely disabled", "warning");
 				return;
 			}
 
@@ -733,7 +801,7 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 				persistState();
 				updateUi(ctx);
 				if (state.enabled) await maybeWarnMissingCredential(ctx);
-				ctx.ui.notify(`Auto mode ${state.enabled ? "enabled" : "disabled"}`, state.enabled ? "info" : "warning");
+				ctx.ui.notify(`pi-safely ${state.enabled ? "enabled" : "disabled"}`, state.enabled ? "info" : "warning");
 				return;
 			}
 
@@ -750,7 +818,7 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 				};
 				persistState();
 				updateUi(ctx);
-				ctx.ui.notify("Auto mode counters reset", "info");
+				ctx.ui.notify("pi-safely counters reset", "info");
 				return;
 			}
 
@@ -759,22 +827,42 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 				state.enabled = config.enabled;
 				persistState();
 				updateUi(ctx);
-				ctx.ui.notify("Reloaded auto-mode.json", "info");
+				ctx.ui.notify(`Reloaded ${getConfigPath(ctx.cwd) ?? "built-in defaults"}`, "info");
+				return;
+			}
+
+			if (command === "provider") {
+				if (remainder) {
+					const provider = remainder.toLowerCase();
+					if (!isSystemOneProvider(provider)) {
+						ctx.ui.notify(usage, "error");
+						return;
+					}
+					// Model IDs and endpoints are provider-specific, so switching resets both.
+					config.provider = provider;
+					config.model = SYSTEM_ONE_PROVIDERS[provider].defaultModel;
+					config.baseUrl = SYSTEM_ONE_PROVIDERS[provider].baseUrl;
+					saveConfig(ctx.cwd, config);
+					ctx.ui.notify(`pi-safely classifier set to ${config.provider}/${config.model}`, "info");
+					await maybeWarnMissingCredential(ctx);
+					return;
+				}
+				ctx.ui.notify(`pi-safely provider: ${config.provider} (${config.baseUrl})`, "info");
 				return;
 			}
 
 			if (command === "model") {
 				if (remainder) {
-					config.jevModel = remainder;
+					config.model = remainder;
 					saveConfig(ctx.cwd, config);
-					ctx.ui.notify(`Auto-mode Jev model set to ${config.jevModel}`, "info");
+					ctx.ui.notify(`pi-safely classifier set to ${config.provider}/${config.model}`, "info");
 					return;
 				}
-				ctx.ui.notify(`Auto-mode Jev model: ${config.jevModel}`, "info");
+				ctx.ui.notify(`pi-safely classifier: ${config.provider}/${config.model}`, "info");
 				return;
 			}
 
-			ctx.ui.notify("Usage: /auto-mode [status|history|on|off|toggle|reset|reload|model [jev-model]]", "error");
+			ctx.ui.notify(usage, "error");
 		},
 	});
 
@@ -822,10 +910,11 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 			return await finalizeDeniedAction(ctx, config, state, denial, actionSummary, persistState, () => updateUi(ctx));
 		}
 
-		const apiKey = await ctx.modelRegistry.getApiKeyForProvider(TYPESAFE_PROVIDER);
+		const apiKey = await getClassifierApiKey(ctx);
 		if (!apiKey) {
+			const { label } = SYSTEM_ONE_PROVIDERS[config.provider];
 			state.lastDecision = config.failOpen ? "allow" : "deny";
-			state.lastReason = "No TypeSafe AI API key available";
+			state.lastReason = `No ${label} API key available`;
 			persistState();
 			updateUi(ctx);
 			if (config.failOpen) return undefined;
@@ -835,7 +924,7 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 			const denial: DenialRecord = {
 				timestamp: Date.now(),
 				toolName: event.toolName,
-				reason: "No TypeSafe AI API key available and failOpen=false; run /login and choose TypeSafe AI",
+				reason: `No ${label} API key available and failOpen=false; ${credentialHint(config.provider)}`,
 				kind: "setup",
 			};
 			recordDenial(denial);
@@ -843,24 +932,26 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 		}
 
 		const transcript = buildTranscript(ctx, config.maxTranscriptLines);
-		const classifierState = buildJevState(ctx, config, transcript, actionSummary);
+		const classifierState = buildClassifierState(ctx, config, transcript, actionSummary);
 
 		try {
-			const result = await classifyWithJev({
+			const result = await classifyWithSystemOne({
+				provider: config.provider,
 				apiKey,
-				baseUrl: config.jevBaseUrl,
-				model: config.jevModel,
+				baseUrl: config.baseUrl,
+				model: config.model,
 				state: classifierState,
 				denyRules: config.denyRules,
-				blockThreshold: config.jevBlockThreshold,
-				timeoutMs: config.jevTimeoutMs,
+				blockThreshold: config.blockThreshold,
+				timeoutMs: config.timeoutMs,
 				signal: ctx.signal,
 			});
+			const reason = `${config.model}: ${result.reason}`;
 
 			if (!result.shouldBlock) {
 				state.consecutiveDenials = 0;
 				state.lastDecision = "allow";
-				state.lastReason = result.reason;
+				state.lastReason = reason;
 				persistState();
 				updateUi(ctx);
 				return undefined;
@@ -871,8 +962,8 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 			const denial: DenialRecord = {
 				timestamp: Date.now(),
 				toolName: event.toolName,
-				reason: result.reason,
-				kind: "jev",
+				reason,
+				kind: "classifier",
 			};
 			recordDenial(denial);
 			return await finalizeDeniedAction(ctx, config, state, denial, actionSummary, persistState, () => updateUi(ctx));
@@ -888,7 +979,7 @@ export default function autoModeExtension(pi: ExtensionAPI) {
 			const denial: DenialRecord = {
 				timestamp: Date.now(),
 				toolName: event.toolName,
-				reason: `Jev classifier failure: ${state.lastReason}`,
+				reason: `Classifier failure (${config.provider}/${config.model}): ${state.lastReason}`,
 				kind: "setup",
 			};
 			recordDenial(denial);

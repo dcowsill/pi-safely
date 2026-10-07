@@ -1,4 +1,35 @@
-export type JevNoulQuestion = {
+// System One decision-model client. TypeSafe (Jev) and OpenRouter (Jev, Cloudflare
+// Clef, ...) serve the same `POST /v1/systemone` wire format; providers differ only in
+// base URL, credential, model IDs, and optional attribution headers.
+
+export type SystemOneProvider = "openrouter" | "typesafe";
+
+export const SYSTEM_ONE_PROVIDERS: Record<
+	SystemOneProvider,
+	{ label: string; baseUrl: string; defaultModel: string; headers: Record<string, string> }
+> = {
+	openrouter: {
+		label: "OpenRouter",
+		baseUrl: "https://openrouter.ai/api",
+		defaultModel: "cloudflare/clef",
+		headers: {
+			"HTTP-Referer": "https://github.com/dcowsill/pi-safely",
+			"X-Title": "pi-safely",
+		},
+	},
+	typesafe: {
+		label: "TypeSafe",
+		baseUrl: "https://api.typesafe.ai",
+		defaultModel: "jev-1.13.0",
+		headers: {},
+	},
+};
+
+export function isSystemOneProvider(value: unknown): value is SystemOneProvider {
+	return typeof value === "string" && Object.hasOwn(SYSTEM_ONE_PROVIDERS, value);
+}
+
+export type NoulQuestion = {
 	type: "noul";
 	instructions: string;
 	criteria: {
@@ -7,20 +38,22 @@ export type JevNoulQuestion = {
 	};
 };
 
-export type JevNoulAnswer = {
+export type NoulAnswer = {
 	type: "noul";
 	noul: number;
 };
 
-export type JevClassificationResult = {
+export type ClassificationResult = {
 	shouldBlock: boolean;
 	reason: string;
 	matches: Array<{ rule: string; probability: number }>;
 	model?: string;
 	inputTokens?: number;
+	costUsd?: number;
 };
 
-export type ClassifyWithJevOptions = {
+export type ClassifyWithSystemOneOptions = {
+	provider: SystemOneProvider;
 	apiKey: string;
 	baseUrl: string;
 	model: string;
@@ -32,11 +65,12 @@ export type ClassifyWithJevOptions = {
 	fetchImpl?: typeof fetch;
 };
 
-type JevSystemOneResponse = {
+type SystemOneResponse = {
 	model?: unknown;
 	answers?: unknown;
 	usage?: {
 		input_tokens?: unknown;
+		cost?: unknown;
 	};
 };
 
@@ -44,9 +78,9 @@ function questionName(index: number): string {
 	return `deny_${String(index + 1).padStart(3, "0")}`;
 }
 
-export function buildPolicyQuestions(denyRules: string[]): Record<string, JevNoulQuestion> {
+export function buildPolicyQuestions(denyRules: string[]): Record<string, NoulQuestion> {
 	if (denyRules.length === 0) {
-		throw new Error("Jev classifier requires at least one deny rule");
+		throw new Error("System One classifier requires at least one deny rule");
 	}
 
 	return Object.fromEntries(
@@ -69,22 +103,22 @@ export function evaluatePolicyAnswers(
 	denyRules: string[],
 	answers: Record<string, unknown>,
 	blockThreshold: number,
-): JevClassificationResult {
+): ClassificationResult {
 	if (!Number.isFinite(blockThreshold) || blockThreshold < 0 || blockThreshold > 1) {
-		throw new Error(`Invalid Jev block threshold: ${blockThreshold}`);
+		throw new Error(`Invalid block threshold: ${blockThreshold}`);
 	}
 	if (denyRules.length === 0) {
-		throw new Error("Jev classifier requires at least one deny rule");
+		throw new Error("System One classifier requires at least one deny rule");
 	}
 
 	const scored = denyRules.map((rule, index) => {
 		const name = questionName(index);
-		const answer = answers[name] as Partial<JevNoulAnswer> | undefined;
+		const answer = answers[name] as Partial<NoulAnswer> | undefined;
 		if (answer?.type !== "noul" || typeof answer.noul !== "number" || !Number.isFinite(answer.noul)) {
-			throw new Error(`Invalid or missing Jev answer: ${name}`);
+			throw new Error(`Invalid or missing System One answer: ${name}`);
 		}
 		if (answer.noul < 0 || answer.noul > 1) {
-			throw new Error(`Out-of-range Jev probability for ${name}: ${answer.noul}`);
+			throw new Error(`Out-of-range System One probability for ${name}: ${answer.noul}`);
 		}
 		return { rule, probability: answer.noul };
 	}).sort((a, b) => b.probability - a.probability);
@@ -96,14 +130,14 @@ export function evaluatePolicyAnswers(
 		const suffix = matches.length > 1 ? ` (+${matches.length - 1} other matched rule${matches.length === 2 ? "" : "s"})` : "";
 		return {
 			shouldBlock: true,
-			reason: `Jev matched deny rule at ${top.probability.toFixed(2)}: ${top.rule}${suffix}`,
+			reason: `Matched deny rule at ${top.probability.toFixed(2)}: ${top.rule}${suffix}`,
 			matches,
 		};
 	}
 
 	return {
 		shouldBlock: false,
-		reason: `Jev found no deny rule at or above ${blockThreshold.toFixed(2)} (highest ${highest.probability.toFixed(2)}: ${highest.rule})`,
+		reason: `No deny rule at or above ${blockThreshold.toFixed(2)} (highest ${highest.probability.toFixed(2)}: ${highest.rule})`,
 		matches: [],
 	};
 }
@@ -134,9 +168,21 @@ function combineWithTimeout(signal: AbortSignal | undefined, timeoutMs: number):
 	};
 }
 
-export async function classifyWithJev(options: ClassifyWithJevOptions): Promise<JevClassificationResult> {
+// Both providers return `{ error: { message } }` on failure; surface it when present.
+async function readErrorMessage(response: Response): Promise<string | undefined> {
+	try {
+		const body = (await response.json()) as { error?: { message?: unknown } | string };
+		const message = typeof body.error === "string" ? body.error : body.error?.message;
+		return typeof message === "string" && message.trim() ? message.trim().split("\n")[0] : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export async function classifyWithSystemOne(options: ClassifyWithSystemOneOptions): Promise<ClassificationResult> {
 	const questions = buildPolicyQuestions(options.denyRules);
 	const fetchImpl = options.fetchImpl ?? fetch;
+	const { label, headers: providerHeaders } = SYSTEM_ONE_PROVIDERS[options.provider];
 	const timedSignal = combineWithTimeout(options.signal, options.timeoutMs);
 	let response: Response;
 
@@ -144,6 +190,7 @@ export async function classifyWithJev(options: ClassifyWithJevOptions): Promise<
 		response = await fetchImpl(`${options.baseUrl.replace(/\/+$/, "")}/v1/systemone`, {
 			method: "POST",
 			headers: {
+				...providerHeaders,
 				Authorization: `Bearer ${options.apiKey}`,
 				Accept: "application/json",
 				"Content-Type": "application/json",
@@ -157,7 +204,7 @@ export async function classifyWithJev(options: ClassifyWithJevOptions): Promise<
 		});
 	} catch (error) {
 		if (timedSignal.didTimeout()) {
-			throw new Error(`TypeSafe API request timed out after ${options.timeoutMs}ms`, { cause: error });
+			throw new Error(`${label} API request timed out after ${options.timeoutMs}ms`, { cause: error });
 		}
 		throw error;
 	} finally {
@@ -165,17 +212,18 @@ export async function classifyWithJev(options: ClassifyWithJevOptions): Promise<
 	}
 
 	if (!response.ok) {
-		throw new Error(`TypeSafe API returned HTTP ${response.status}`);
+		const message = await readErrorMessage(response);
+		throw new Error(`${label} API returned HTTP ${response.status}${message ? `: ${message}` : ""}`);
 	}
 
-	let payload: JevSystemOneResponse;
+	let payload: SystemOneResponse;
 	try {
-		payload = (await response.json()) as JevSystemOneResponse;
+		payload = (await response.json()) as SystemOneResponse;
 	} catch (error) {
-		throw new Error("TypeSafe API returned invalid JSON", { cause: error });
+		throw new Error(`${label} API returned invalid JSON`, { cause: error });
 	}
 	if (!payload.answers || typeof payload.answers !== "object" || Array.isArray(payload.answers)) {
-		throw new Error("TypeSafe API response did not contain an answers object");
+		throw new Error(`${label} API response did not contain an answers object`);
 	}
 
 	const result = evaluatePolicyAnswers(
@@ -188,5 +236,6 @@ export async function classifyWithJev(options: ClassifyWithJevOptions): Promise<
 		model: typeof payload.model === "string" ? payload.model : undefined,
 		inputTokens:
 			typeof payload.usage?.input_tokens === "number" ? payload.usage.input_tokens : undefined,
+		costUsd: typeof payload.usage?.cost === "number" ? payload.usage.cost : undefined,
 	};
 }

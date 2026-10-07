@@ -1,26 +1,32 @@
 {
-  "name": "pi-auto-mode",
-  "version": "0.2.1",
-  "description": "A pi auto-mode extension with a TypeSafe Jev System One policy classifier.",
+  "name": "pi-safely",
+  "version": "0.3.0",
+  "description": "Claude Code-style auto mode for pi, gated by System One decision models (Cloudflare Clef via OpenRouter, or TypeSafe Jev).",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://git.armless.xyz/dan/pi-auto-mode.git"
+    "url": "git+https://github.com/dcowsill/pi-safely.git"
   },
-  "homepage": "https://git.armless.xyz/dan/pi-auto-mode",
+  "homepage": "https://github.com/dcowsill/pi-safely",
   "bugs": {
-    "url": "https://git.armless.xyz/dan/pi-auto-mode/issues"
+    "url": "https://github.com/dcowsill/pi-safely/issues"
   },
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "auto-mode",
+    "system-one",
+    "guardrails"
+  ],
   "files": [
     "extensions",
     "src",
     "README.md",
-    "auto-mode.example.json"
+    "safely.example.json"
   ],
   "scripts": {
-    "test": "node tests/jev-classifier.test.ts"
+    "test": "node tests/system-one-classifier.test.ts"
   },
   "publishConfig": {
     "access": "public"
@@ -34,6 +40,8 @@
     }
   },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   }
 }
